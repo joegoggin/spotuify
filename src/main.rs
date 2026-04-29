@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::time::Duration;
 
+use config::ConfigBootstrap;
 use tuirealm::application::{Application, PollStrategy};
 use tuirealm::command::{Cmd, CmdResult};
 use tuirealm::component::{AppComponent, Component};
@@ -14,6 +15,8 @@ use tuirealm::ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tuirealm::state::State;
 use tuirealm::terminal::{CrosstermTerminalAdapter, TerminalAdapter, TerminalResult};
 
+mod config;
+
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -22,6 +25,8 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const SHELL_TICKS_ATTR: &str = "shell.ticks";
 const SHELL_TERMINAL_WIDTH_ATTR: &str = "shell.terminal_width";
 const SHELL_TERMINAL_HEIGHT_ATTR: &str = "shell.terminal_height";
+const SHELL_ACTIVE_SCREEN_ATTR: &str = "shell.active_screen";
+const SHELL_CONFIG_STATUS_ATTR: &str = "shell.config_status";
 
 fn main() {
     if let Err(err) = run() {
@@ -65,6 +70,18 @@ pub enum Screen {
     Auth,
     /// Fatal error recovery screen.
     FatalError,
+}
+
+impl Screen {
+    /// Returns the display label for a screen route.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Home => "Home",
+            Self::Setup => "Setup",
+            Self::Auth => "Auth",
+            Self::FatalError => "Fatal Error",
+        }
+    }
 }
 
 /// Navigation transitions supported by the app router.
@@ -129,8 +146,13 @@ struct Router {
 impl Router {
     /// Creates router state with the default entry screen.
     fn new() -> Self {
+        Self::with_initial_screen(Screen::Home)
+    }
+
+    /// Creates router state with a specific entry screen.
+    fn with_initial_screen(screen: Screen) -> Self {
         Self {
-            stack: vec![Screen::Home],
+            stack: vec![screen],
         }
     }
 
@@ -181,14 +203,25 @@ struct AppState {
     needs_redraw: bool,
     /// Current screen route and navigation history.
     router: Router,
+    /// Config bootstrap state loaded at startup.
+    config: ConfigBootstrap,
     /// State rendered by the shell component.
     shell: ShellState,
 }
 
 impl AppState {
     /// Creates the initial app state with the first draw requested.
-    fn new() -> Self {
-        let mut state = Self::default();
+    fn new(config: ConfigBootstrap) -> Self {
+        let initial_screen = if config.is_ready() {
+            Screen::Auth
+        } else {
+            Screen::Setup
+        };
+        let mut state = Self {
+            router: Router::with_initial_screen(initial_screen),
+            config,
+            ..Self::default()
+        };
         state.apply(Action::RequestRedraw);
         state
     }
@@ -229,18 +262,34 @@ impl Default for AppState {
             should_quit: false,
             needs_redraw: false,
             router: Router::default(),
+            config: ConfigBootstrap::default(),
             shell: ShellState::default(),
         }
     }
 }
 
 /// Shell-specific data owned by the app state.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ShellState {
     /// Number of tick events processed by the app.
     ticks: u64,
     /// Most recent terminal size observed from resize events.
     terminal_size: Option<(u16, u16)>,
+    /// Active screen label rendered by the shell.
+    active_screen: String,
+    /// User-facing config bootstrap status rendered by the shell.
+    config_status: String,
+}
+
+impl Default for ShellState {
+    fn default() -> Self {
+        Self {
+            ticks: 0,
+            terminal_size: None,
+            active_screen: Screen::Home.label().to_owned(),
+            config_status: "config not checked".to_owned(),
+        }
+    }
 }
 
 /// Runtime model tying tui-realm, terminal IO, and app state together.
@@ -253,9 +302,11 @@ struct Model {
 impl Model {
     /// Creates a runtime model and initializes the terminal.
     fn new() -> AppResult<Self> {
+        let config = ConfigBootstrap::load();
+
         Ok(Self {
             app: Self::init_app()?,
-            state: AppState::new(),
+            state: AppState::new(config),
             terminal: Self::init_terminal()?,
         })
     }
@@ -327,6 +378,17 @@ impl Model {
             )?;
         }
 
+        self.app.attr(
+            &Id::Shell,
+            Attribute::Custom(SHELL_ACTIVE_SCREEN_ATTR),
+            AttrValue::String(self.state.router.current().label().to_owned()),
+        )?;
+        self.app.attr(
+            &Id::Shell,
+            Attribute::Custom(SHELL_CONFIG_STATUS_ATTR),
+            AttrValue::String(self.state.config.status_label()),
+        )?;
+
         Ok(())
     }
 }
@@ -345,7 +407,9 @@ impl Component for Shell {
             .map(|(width, height)| format!("{width}x{height}"))
             .unwrap_or_else(|| format!("{}x{}", area.width, area.height));
         let text = format!(
-            "App shell running\n\nEvent loop: active\nDraw cycle: active\nTerminal: raw mode + alternate screen\nSize: {size}\nTicks: {}\n\nPress q, Esc, or Ctrl-C to quit.",
+            "App shell running\n\nScreen: {}\nConfig: {}\n\nEvent loop: active\nDraw cycle: active\nTerminal: raw mode + alternate screen\nSize: {size}\nTicks: {}\n\nPress q, Esc, or Ctrl-C to quit.",
+            self.render_state.active_screen,
+            self.render_state.config_status,
             self.render_state.ticks
         );
 
@@ -377,6 +441,12 @@ impl Component for Shell {
             (Attribute::Custom(SHELL_TERMINAL_HEIGHT_ATTR), AttrValue::Size(height)) => {
                 let (width, _) = self.render_state.terminal_size.unwrap_or_default();
                 self.render_state.terminal_size = Some((width, height));
+            }
+            (Attribute::Custom(SHELL_ACTIVE_SCREEN_ATTR), AttrValue::String(active_screen)) => {
+                self.render_state.active_screen = active_screen;
+            }
+            (Attribute::Custom(SHELL_CONFIG_STATUS_ATTR), AttrValue::String(config_status)) => {
+                self.render_state.config_status = config_status;
             }
             _ => {}
         }
@@ -420,15 +490,54 @@ impl AppComponent<Msg, NoUserEvent> for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    use crate::config::{AppConfig, ConfigIssue, SpotifyConfig};
+
+    fn valid_config_bootstrap() -> ConfigBootstrap {
+        ConfigBootstrap::Ready {
+            path: PathBuf::from("/tmp/spotuify/config.toml"),
+            config: AppConfig {
+                spotify: SpotifyConfig {
+                    client_id: Some("client-id".to_owned()),
+                    redirect_uri: Some("http://127.0.0.1:8888/callback".to_owned()),
+                },
+            },
+        }
+    }
+
+    fn missing_config_bootstrap() -> ConfigBootstrap {
+        ConfigBootstrap::NeedsSetup {
+            path: Some(PathBuf::from("/tmp/spotuify/config.toml")),
+            issue: ConfigIssue::MissingFile,
+        }
+    }
 
     #[test]
-    fn app_state_starts_with_initial_redraw_requested() {
-        let state = AppState::new();
+    fn app_state_starts_with_setup_screen_for_missing_config() {
+        let bootstrap = missing_config_bootstrap();
+
+        let state = AppState::new(bootstrap.clone());
 
         assert!(!state.should_quit);
         assert!(state.needs_redraw);
-        assert_eq!(state.router.current(), Screen::Home);
-        assert_eq!(state.router.stack, vec![Screen::Home]);
+        assert_eq!(state.router.current(), Screen::Setup);
+        assert_eq!(state.router.stack, vec![Screen::Setup]);
+        assert_eq!(state.config, bootstrap);
+        assert_eq!(state.shell, ShellState::default());
+    }
+
+    #[test]
+    fn app_state_starts_with_auth_screen_for_valid_config() {
+        let bootstrap = valid_config_bootstrap();
+
+        let state = AppState::new(bootstrap.clone());
+
+        assert!(!state.should_quit);
+        assert!(state.needs_redraw);
+        assert_eq!(state.router.current(), Screen::Auth);
+        assert_eq!(state.router.stack, vec![Screen::Auth]);
+        assert_eq!(state.config, bootstrap);
         assert_eq!(state.shell, ShellState::default());
     }
 
@@ -520,7 +629,7 @@ mod tests {
         let mut state = AppState {
             shell: ShellState {
                 ticks: u64::MAX,
-                terminal_size: None,
+                ..ShellState::default()
             },
             ..AppState::default()
         };
@@ -616,12 +725,22 @@ mod tests {
             Attribute::Custom(SHELL_TERMINAL_HEIGHT_ATTR),
             AttrValue::Size(24),
         );
+        shell.attr(
+            Attribute::Custom(SHELL_ACTIVE_SCREEN_ATTR),
+            AttrValue::String("Setup".to_owned()),
+        );
+        shell.attr(
+            Attribute::Custom(SHELL_CONFIG_STATUS_ATTR),
+            AttrValue::String("missing config file; setup required".to_owned()),
+        );
 
         assert_eq!(
             shell.render_state,
             ShellState {
                 ticks: 42,
                 terminal_size: Some((80, 24)),
+                active_screen: "Setup".to_owned(),
+                config_status: "missing config file; setup required".to_owned(),
             }
         );
     }
