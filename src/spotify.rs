@@ -1,8 +1,13 @@
 use std::error::Error;
 use std::fmt;
 
+use rspotify::http::Query;
 use rspotify::prelude::BaseClient;
 use rspotify::{AuthCodePkceSpotify, ClientError};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+
+const TRANSIENT_RETRY_LIMIT: usize = 2;
 
 /// Central wrapper for Spotify API access.
 #[derive(Debug, Clone)]
@@ -21,6 +26,59 @@ impl SpotifyService {
         &self.client
     }
 
+    /// Sends an authenticated GET request to a Spotify API endpoint and decodes JSON.
+    pub(crate) fn get_json<T>(
+        &self,
+        endpoint: &str,
+        query: &Query<'_>,
+    ) -> Result<T, SpotifyServiceError>
+    where
+        T: DeserializeOwned,
+    {
+        let response =
+            self.request_with_transient_retry(|client| client.api_get(endpoint, query))?;
+        decode_json_response(&response)
+    }
+
+    /// Sends an authenticated POST request to a Spotify API endpoint and decodes JSON.
+    pub(crate) fn post_json<T>(
+        &self,
+        endpoint: &str,
+        payload: &Value,
+    ) -> Result<T, SpotifyServiceError>
+    where
+        T: DeserializeOwned,
+    {
+        let response =
+            self.request_with_transient_retry(|client| client.api_post(endpoint, payload))?;
+        decode_json_response(&response)
+    }
+
+    /// Sends an authenticated PUT request to a Spotify API endpoint and decodes JSON.
+    pub(crate) fn put_json<T>(
+        &self,
+        endpoint: &str,
+        payload: &Value,
+    ) -> Result<T, SpotifyServiceError>
+    where
+        T: DeserializeOwned,
+    {
+        let response =
+            self.request_with_transient_retry(|client| client.api_put(endpoint, payload))?;
+        decode_json_response(&response)
+    }
+
+    /// Sends an authenticated PUT request to a Spotify API endpoint that returns no body.
+    pub(crate) fn put_empty(
+        &self,
+        endpoint: &str,
+        payload: &Value,
+    ) -> Result<(), SpotifyServiceError> {
+        let response =
+            self.request_with_transient_retry(|client| client.api_put(endpoint, payload))?;
+        decode_empty_response(&response)
+    }
+
     /// Runs a Spotify request, refreshes expired auth once, and retries once.
     pub(crate) fn request_with_auth_retry<T>(
         &self,
@@ -31,6 +89,20 @@ impl SpotifyService {
             || self.refresh_token(),
             is_auth_expired_error,
             SpotifyServiceError::from_client_error,
+        )
+    }
+
+    fn request_with_transient_retry(
+        &self,
+        mut request: impl FnMut(&AuthCodePkceSpotify) -> Result<String, ClientError>,
+    ) -> Result<String, SpotifyServiceError> {
+        run_with_refresh_and_transient_retry(
+            || request(&self.client),
+            || self.refresh_token(),
+            is_auth_expired_error,
+            is_transient_client_error,
+            SpotifyServiceError::from_client_error,
+            TRANSIENT_RETRY_LIMIT,
         )
     }
 
@@ -67,8 +139,14 @@ impl SpotifyService {
 pub(crate) enum SpotifyServiceError {
     /// Spotify credentials cannot be refreshed automatically.
     ReauthorizationRequired(String),
-    /// Spotify returned a non-auth client error.
+    /// Spotify rate limited the request after retries were exhausted.
+    RateLimited(String),
+    /// Spotify or the network returned a transient failure after retries were exhausted.
+    Transient(String),
+    /// Spotify returned a non-auth, non-transient client error.
     Spotify(String),
+    /// Spotify returned a response body that could not be decoded for the requested type.
+    Decode(String),
 }
 
 impl SpotifyServiceError {
@@ -77,8 +155,13 @@ impl SpotifyServiceError {
             Self::ReauthorizationRequired(
                 "Spotify credentials are invalid or expired; reauthorization required".to_owned(),
             )
+        } else if let Some(status) = client_error_status(&err) {
+            let message = spotify_client_error_message(err);
+            Self::from_status(status, message)
+        } else if is_transient_transport_error(&err) {
+            Self::Transient(spotify_client_error_message(err))
         } else {
-            Self::Spotify(err.to_string())
+            Self::Spotify(spotify_client_error_message(err))
         }
     }
 
@@ -87,14 +170,37 @@ impl SpotifyServiceError {
             "Spotify token refresh failed ({err}); reauthorization required"
         ))
     }
+
+    fn decode_failed(err: serde_json::Error) -> Self {
+        Self::Decode(format!("Spotify response JSON decode failed: {err}"))
+    }
+
+    fn unexpected_body(body: &str) -> Self {
+        Self::Decode(format!(
+            "Spotify response was expected to be empty but returned {} bytes",
+            body.len()
+        ))
+    }
+
+    fn from_status(status: u16, message: String) -> Self {
+        if status == 429 {
+            Self::RateLimited(message)
+        } else if is_transient_status(status) {
+            Self::Transient(message)
+        } else {
+            Self::Spotify(message)
+        }
+    }
 }
 
 impl fmt::Display for SpotifyServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ReauthorizationRequired(message) | Self::Spotify(message) => {
-                formatter.write_str(message)
-            }
+            Self::ReauthorizationRequired(message)
+            | Self::RateLimited(message)
+            | Self::Transient(message)
+            | Self::Spotify(message)
+            | Self::Decode(message) => formatter.write_str(message),
         }
     }
 }
@@ -129,6 +235,37 @@ fn run_with_refresh_retry<T, E>(
     }
 }
 
+fn run_with_refresh_and_transient_retry<T, E>(
+    mut request: impl FnMut() -> Result<T, E>,
+    mut refresh: impl FnMut() -> Result<(), SpotifyServiceError>,
+    is_refreshable_auth_error: impl Fn(&E) -> bool,
+    is_transient_error: impl Fn(&E) -> bool,
+    map_error: impl Fn(E) -> SpotifyServiceError,
+    transient_retry_limit: usize,
+) -> Result<T, SpotifyServiceError> {
+    let mut refreshed = false;
+    let mut transient_retries = 0;
+
+    loop {
+        match request() {
+            Ok(value) => return Ok(value),
+            Err(err) if is_refreshable_auth_error(&err) && !refreshed => {
+                refreshed = true;
+                refresh()?;
+            }
+            Err(err) if is_refreshable_auth_error(&err) => {
+                return Err(SpotifyServiceError::ReauthorizationRequired(
+                    "Spotify rejected refreshed credentials; reauthorization required".to_owned(),
+                ));
+            }
+            Err(err) if is_transient_error(&err) && transient_retries < transient_retry_limit => {
+                transient_retries += 1;
+            }
+            Err(err) => return Err(map_error(err)),
+        }
+    }
+}
+
 fn is_auth_expired_error(err: &ClientError) -> bool {
     match err {
         ClientError::InvalidToken => true,
@@ -140,6 +277,70 @@ fn is_auth_expired_error(err: &ClientError) -> bool {
     }
 }
 
+fn is_transient_client_error(err: &ClientError) -> bool {
+    client_error_status(err).is_some_and(is_transient_status) || is_transient_transport_error(err)
+}
+
+fn is_transient_transport_error(err: &ClientError) -> bool {
+    match err {
+        ClientError::Http(http_error) => match http_error.as_ref() {
+            rspotify::http::HttpError::Transport(_) | rspotify::http::HttpError::Io(_) => true,
+            rspotify::http::HttpError::StatusCode(_) => false,
+        },
+        _ => false,
+    }
+}
+
+fn client_error_status(err: &ClientError) -> Option<u16> {
+    match err {
+        ClientError::Http(http_error) => match http_error.as_ref() {
+            rspotify::http::HttpError::StatusCode(response) => Some(response.status()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+fn spotify_client_error_message(err: ClientError) -> String {
+    match err {
+        ClientError::Http(http_error) => match *http_error {
+            rspotify::http::HttpError::StatusCode(response) => {
+                let status = response.status();
+                match response.into_string() {
+                    Ok(body) if !body.trim().is_empty() => {
+                        format!("Spotify API returned HTTP {status}: {body}")
+                    }
+                    Ok(_) => format!("Spotify API returned HTTP {status}"),
+                    Err(err) => format!(
+                        "Spotify API returned HTTP {status}; could not read response body: {err}"
+                    ),
+                }
+            }
+            other => other.to_string(),
+        },
+        other => other.to_string(),
+    }
+}
+
+fn decode_json_response<T>(response: &str) -> Result<T, SpotifyServiceError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str(response).map_err(SpotifyServiceError::decode_failed)
+}
+
+fn decode_empty_response(response: &str) -> Result<(), SpotifyServiceError> {
+    if response.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(SpotifyServiceError::unexpected_body(response))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +348,7 @@ mod tests {
     #[derive(Debug)]
     enum TestError {
         Auth,
+        Transient,
         Other,
     }
 
@@ -255,6 +457,146 @@ mod tests {
     #[test]
     fn invalid_token_is_auth_expired_error() {
         assert!(is_auth_expired_error(&ClientError::InvalidToken));
+    }
+
+    #[test]
+    fn resilient_retry_helper_retries_transient_errors_to_success() {
+        let mut attempts = 0;
+        let mut refreshes = 0;
+
+        let result = run_with_refresh_and_transient_retry(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(TestError::Transient)
+                } else {
+                    Ok("ok")
+                }
+            },
+            || {
+                refreshes += 1;
+                Ok(())
+            },
+            |err| matches!(err, TestError::Auth),
+            |err| matches!(err, TestError::Transient),
+            map_test_error,
+            TRANSIENT_RETRY_LIMIT,
+        )
+        .expect("transient retry should eventually return success");
+
+        assert_eq!(result, "ok");
+        assert_eq!(attempts, 3);
+        assert_eq!(refreshes, 0);
+    }
+
+    #[test]
+    fn resilient_retry_helper_returns_final_transient_error_after_limit() {
+        let mut attempts = 0;
+
+        let err = run_with_refresh_and_transient_retry(
+            || {
+                attempts += 1;
+                Err::<(), _>(TestError::Transient)
+            },
+            || Ok(()),
+            |err| matches!(err, TestError::Auth),
+            |err| matches!(err, TestError::Transient),
+            |_| SpotifyServiceError::Transient("final transient".to_owned()),
+            TRANSIENT_RETRY_LIMIT,
+        )
+        .expect_err("transient retry limit should be enforced");
+
+        assert_eq!(
+            err,
+            SpotifyServiceError::Transient("final transient".to_owned())
+        );
+        assert_eq!(attempts, TRANSIENT_RETRY_LIMIT + 1);
+    }
+
+    #[test]
+    fn resilient_retry_helper_refreshes_auth_once_across_transient_retries() {
+        let mut attempts = 0;
+        let mut refreshes = 0;
+
+        let result = run_with_refresh_and_transient_retry(
+            || {
+                attempts += 1;
+                match attempts {
+                    1 => Err(TestError::Transient),
+                    2 => Err(TestError::Auth),
+                    _ => Ok("ok"),
+                }
+            },
+            || {
+                refreshes += 1;
+                Ok(())
+            },
+            |err| matches!(err, TestError::Auth),
+            |err| matches!(err, TestError::Transient),
+            map_test_error,
+            TRANSIENT_RETRY_LIMIT,
+        )
+        .expect("auth refresh should compose with transient retries");
+
+        assert_eq!(result, "ok");
+        assert_eq!(attempts, 3);
+        assert_eq!(refreshes, 1);
+    }
+
+    #[test]
+    fn transient_status_detection_covers_rate_limit_and_server_errors() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(is_transient_status(status));
+        }
+    }
+
+    #[test]
+    fn transient_status_detection_rejects_non_transient_client_errors() {
+        for status in [400, 403, 404] {
+            assert!(!is_transient_status(status));
+        }
+    }
+
+    #[test]
+    fn status_mapping_keeps_rate_limits_distinct_from_server_errors() {
+        assert_eq!(
+            SpotifyServiceError::from_status(429, "rate limit".to_owned()),
+            SpotifyServiceError::RateLimited("rate limit".to_owned())
+        );
+        assert_eq!(
+            SpotifyServiceError::from_status(503, "unavailable".to_owned()),
+            SpotifyServiceError::Transient("unavailable".to_owned())
+        );
+        assert_eq!(
+            SpotifyServiceError::from_status(404, "missing".to_owned()),
+            SpotifyServiceError::Spotify("missing".to_owned())
+        );
+    }
+
+    #[test]
+    fn decode_json_response_maps_invalid_body_to_decode_error() {
+        let err = decode_json_response::<serde_json::Value>("not json")
+            .expect_err("invalid JSON should be mapped to decode error");
+
+        assert!(matches!(err, SpotifyServiceError::Decode(_)));
+    }
+
+    #[test]
+    fn decode_empty_response_accepts_empty_success_body() {
+        decode_empty_response("").expect("empty body should be accepted");
+        decode_empty_response(" \n\t ").expect("whitespace body should be accepted");
+    }
+
+    #[test]
+    fn decode_empty_response_rejects_unexpected_body() {
+        let err = decode_empty_response("{}").expect_err("non-empty body should be rejected");
+
+        assert_eq!(
+            err,
+            SpotifyServiceError::Decode(
+                "Spotify response was expected to be empty but returned 2 bytes".to_owned()
+            )
+        );
     }
 
     #[test]
