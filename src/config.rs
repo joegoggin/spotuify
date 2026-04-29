@@ -214,7 +214,12 @@ impl RequiredConfigField {
 
 /// Resolves the expected user config file path.
 fn expected_config_path() -> Option<PathBuf> {
-    xdg::BaseDirectories::with_prefix(APP_CONFIG_DIR).get_config_file(CONFIG_FILE_NAME)
+    app_config_file_path(CONFIG_FILE_NAME)
+}
+
+/// Resolves a file path inside the application's XDG config directory.
+pub(crate) fn app_config_file_path(file_name: &str) -> Option<PathBuf> {
+    xdg::BaseDirectories::with_prefix(APP_CONFIG_DIR).get_config_file(file_name)
 }
 
 /// Returns true when a required string field is missing or all whitespace.

@@ -1,6 +1,8 @@
 use std::error::Error;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
+use auth::AuthEvent;
 use config::ConfigBootstrap;
 use tuirealm::application::{Application, PollStrategy};
 use tuirealm::command::{Cmd, CmdResult};
@@ -15,6 +17,7 @@ use tuirealm::ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tuirealm::state::State;
 use tuirealm::terminal::{CrosstermTerminalAdapter, TerminalAdapter, TerminalResult};
 
+mod auth;
 mod config;
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
@@ -27,6 +30,8 @@ const SHELL_TERMINAL_WIDTH_ATTR: &str = "shell.terminal_width";
 const SHELL_TERMINAL_HEIGHT_ATTR: &str = "shell.terminal_height";
 const SHELL_ACTIVE_SCREEN_ATTR: &str = "shell.active_screen";
 const SHELL_CONFIG_STATUS_ATTR: &str = "shell.config_status";
+const SHELL_AUTH_STATUS_ATTR: &str = "shell.auth_status";
+const SHELL_AUTH_URL_ATTR: &str = "shell.auth_url";
 
 fn main() {
     if let Err(err) = run() {
@@ -42,6 +47,7 @@ fn run() -> AppResult<()> {
         for msg in model.app.tick(PollStrategy::Once(FRAME_INTERVAL))? {
             model.update(msg);
         }
+        model.drain_auth_events();
 
         if model.state.needs_redraw {
             model.view()?;
@@ -109,7 +115,7 @@ pub enum Msg {
 }
 
 /// Actions handled by the central state dispatcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
     /// Mark the app as ready to shut down.
     Quit,
@@ -119,6 +125,8 @@ enum Action {
     Resize { width: u16, height: u16 },
     /// Apply a screen navigation transition.
     Navigate(ScreenTransition),
+    /// Apply a Spotify auth flow status update.
+    AuthEvent(AuthEvent),
     /// Mark the UI as needing a redraw.
     RequestRedraw,
     /// Mark the current draw request as handled.
@@ -195,7 +203,7 @@ impl Default for Router {
 }
 
 /// Shared state for the running application.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AppState {
     /// Whether the main event loop should exit.
     should_quit: bool,
@@ -205,6 +213,8 @@ struct AppState {
     router: Router,
     /// Config bootstrap state loaded at startup.
     config: ConfigBootstrap,
+    /// Spotify auth flow state for the running app.
+    auth: AuthUiState,
     /// State rendered by the shell component.
     shell: ShellState,
 }
@@ -217,8 +227,10 @@ impl AppState {
         } else {
             Screen::Setup
         };
+        let auth = AuthUiState::from_config(&config);
         let mut state = Self {
             router: Router::with_initial_screen(initial_screen),
+            auth,
             config,
             ..Self::default()
         };
@@ -246,6 +258,10 @@ impl AppState {
                     self.needs_redraw = true;
                 }
             }
+            Action::AuthEvent(event) => {
+                self.auth.apply(event);
+                self.needs_redraw = true;
+            }
             Action::RequestRedraw => {
                 self.needs_redraw = true;
             }
@@ -256,14 +272,94 @@ impl AppState {
     }
 }
 
-impl Default for AppState {
+/// User-facing auth state rendered by the shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthUiState {
+    /// Current auth status label.
+    status: String,
+    /// Authorization URL shown when browser launch fails or manual copy is needed.
+    authorize_url: Option<String>,
+    /// Browser launch failure retained while the callback listener waits.
+    browser_open_error: Option<String>,
+}
+
+impl AuthUiState {
+    /// Creates initial auth UI state from startup config readiness.
+    fn from_config(config: &ConfigBootstrap) -> Self {
+        if config.is_ready() {
+            Self {
+                status: "Spotify auth starting".to_owned(),
+                ..Self::default()
+            }
+        } else {
+            Self {
+                status: "Spotify auth waiting for setup".to_owned(),
+                ..Self::default()
+            }
+        }
+    }
+
+    /// Applies an auth worker event to the rendered status.
+    fn apply(&mut self, event: AuthEvent) {
+        match event {
+            AuthEvent::Starting => {
+                self.status = "Spotify auth starting".to_owned();
+                self.authorize_url = None;
+                self.browser_open_error = None;
+            }
+            AuthEvent::Cached { cache_path } => {
+                self.status = format!(
+                    "Spotify session loaded from cached token at {}",
+                    cache_path.display()
+                );
+                self.authorize_url = None;
+                self.browser_open_error = None;
+            }
+            AuthEvent::AuthorizationUrl { url, callback_addr } => {
+                self.status =
+                    format!("Spotify authorization URL generated; waiting on {callback_addr}");
+                self.authorize_url = Some(url);
+            }
+            AuthEvent::BrowserOpenFailed { message } => {
+                self.status = format!(
+                    "Could not open browser automatically; copy the auth URL below ({message})"
+                );
+                self.browser_open_error = Some(message);
+            }
+            AuthEvent::WaitingForCallback { callback_addr } => {
+                self.status = if self.browser_open_error.is_some() {
+                    format!(
+                        "Waiting for Spotify callback on {callback_addr}; browser did not open automatically"
+                    )
+                } else {
+                    format!("Waiting for Spotify callback on {callback_addr}")
+                };
+            }
+            AuthEvent::ExchangingCode => {
+                self.status = "Spotify callback received; exchanging code for tokens".to_owned();
+            }
+            AuthEvent::Completed { cache_path } => {
+                self.status = format!(
+                    "Spotify session authenticated and saved at {}",
+                    cache_path.display()
+                );
+                self.authorize_url = None;
+                self.browser_open_error = None;
+            }
+            AuthEvent::Failed { message } => {
+                self.status = format!("Spotify auth failed: {message}");
+                self.browser_open_error = None;
+            }
+        }
+    }
+}
+
+impl Default for AuthUiState {
     fn default() -> Self {
         Self {
-            should_quit: false,
-            needs_redraw: false,
-            router: Router::default(),
-            config: ConfigBootstrap::default(),
-            shell: ShellState::default(),
+            status: "Spotify auth not started".to_owned(),
+            authorize_url: None,
+            browser_open_error: None,
         }
     }
 }
@@ -279,6 +375,10 @@ struct ShellState {
     active_screen: String,
     /// User-facing config bootstrap status rendered by the shell.
     config_status: String,
+    /// User-facing Spotify auth status rendered by the shell.
+    auth_status: String,
+    /// Authorization URL rendered when user action may be required.
+    auth_url: Option<String>,
 }
 
 impl Default for ShellState {
@@ -288,6 +388,8 @@ impl Default for ShellState {
             terminal_size: None,
             active_screen: Screen::Home.label().to_owned(),
             config_status: "config not checked".to_owned(),
+            auth_status: "Spotify auth not started".to_owned(),
+            auth_url: None,
         }
     }
 }
@@ -297,17 +399,23 @@ struct Model {
     app: Application<Id, Msg, NoUserEvent>,
     state: AppState,
     terminal: CrosstermTerminalAdapter,
+    auth_rx: Option<Receiver<AuthEvent>>,
 }
 
 impl Model {
     /// Creates a runtime model and initializes the terminal.
     fn new() -> AppResult<Self> {
         let config = ConfigBootstrap::load();
+        let auth_rx = match &config {
+            ConfigBootstrap::Ready { config, .. } => Some(auth::spawn_auth_flow(config.clone())),
+            ConfigBootstrap::NeedsSetup { .. } => None,
+        };
 
         Ok(Self {
             app: Self::init_app()?,
             state: AppState::new(config),
             terminal: Self::init_terminal()?,
+            auth_rx,
         })
     }
 
@@ -338,6 +446,38 @@ impl Model {
     /// Dispatches a component message through the central update pipeline.
     fn update(&mut self, msg: Msg) {
         self.dispatch(Action::from(msg));
+    }
+
+    /// Drains any pending Spotify auth status updates from the worker thread.
+    fn drain_auth_events(&mut self) {
+        let mut events = Vec::new();
+        let mut clear_receiver = false;
+
+        if let Some(receiver) = &self.auth_rx {
+            loop {
+                match receiver.try_recv() {
+                    Ok(event) => {
+                        if event.is_terminal() {
+                            clear_receiver = true;
+                        }
+                        events.push(event);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        clear_receiver = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            self.dispatch(Action::AuthEvent(event));
+        }
+
+        if clear_receiver {
+            self.auth_rx = None;
+        }
     }
 
     /// Applies an action to the app state.
@@ -388,6 +528,16 @@ impl Model {
             Attribute::Custom(SHELL_CONFIG_STATUS_ATTR),
             AttrValue::String(self.state.config.status_label()),
         )?;
+        self.app.attr(
+            &Id::Shell,
+            Attribute::Custom(SHELL_AUTH_STATUS_ATTR),
+            AttrValue::String(self.state.auth.status.clone()),
+        )?;
+        self.app.attr(
+            &Id::Shell,
+            Attribute::Custom(SHELL_AUTH_URL_ATTR),
+            AttrValue::String(self.state.auth.authorize_url.clone().unwrap_or_default()),
+        )?;
 
         Ok(())
     }
@@ -406,12 +556,20 @@ impl Component for Shell {
             .terminal_size
             .map(|(width, height)| format!("{width}x{height}"))
             .unwrap_or_else(|| format!("{}x{}", area.width, area.height));
-        let text = format!(
-            "App shell running\n\nScreen: {}\nConfig: {}\n\nEvent loop: active\nDraw cycle: active\nTerminal: raw mode + alternate screen\nSize: {size}\nTicks: {}\n\nPress q, Esc, or Ctrl-C to quit.",
+        let mut text = format!(
+            "App shell running\n\nScreen: {}\nConfig: {}\nAuth: {}\n\nEvent loop: active\nDraw cycle: active\nTerminal: raw mode + alternate screen\nSize: {size}\nTicks: {}",
             self.render_state.active_screen,
             self.render_state.config_status,
+            self.render_state.auth_status,
             self.render_state.ticks
         );
+        if let Some(auth_url) = self.render_state.auth_url.as_deref()
+            && !auth_url.is_empty()
+        {
+            text.push_str("\n\nSpotify auth URL:\n");
+            text.push_str(auth_url);
+        }
+        text.push_str("\n\nPress q, Esc, or Ctrl-C to quit.");
 
         let widget = Paragraph::new(text)
             .block(
@@ -447,6 +605,16 @@ impl Component for Shell {
             }
             (Attribute::Custom(SHELL_CONFIG_STATUS_ATTR), AttrValue::String(config_status)) => {
                 self.render_state.config_status = config_status;
+            }
+            (Attribute::Custom(SHELL_AUTH_STATUS_ATTR), AttrValue::String(auth_status)) => {
+                self.render_state.auth_status = auth_status;
+            }
+            (Attribute::Custom(SHELL_AUTH_URL_ATTR), AttrValue::String(auth_url)) => {
+                self.render_state.auth_url = if auth_url.is_empty() {
+                    None
+                } else {
+                    Some(auth_url)
+                };
             }
             _ => {}
         }
@@ -733,6 +901,14 @@ mod tests {
             Attribute::Custom(SHELL_CONFIG_STATUS_ATTR),
             AttrValue::String("missing config file; setup required".to_owned()),
         );
+        shell.attr(
+            Attribute::Custom(SHELL_AUTH_STATUS_ATTR),
+            AttrValue::String("Spotify auth starting".to_owned()),
+        );
+        shell.attr(
+            Attribute::Custom(SHELL_AUTH_URL_ATTR),
+            AttrValue::String("http://127.0.0.1:8888/authorize".to_owned()),
+        );
 
         assert_eq!(
             shell.render_state,
@@ -741,6 +917,8 @@ mod tests {
                 terminal_size: Some((80, 24)),
                 active_screen: "Setup".to_owned(),
                 config_status: "missing config file; setup required".to_owned(),
+                auth_status: "Spotify auth starting".to_owned(),
+                auth_url: Some("http://127.0.0.1:8888/authorize".to_owned()),
             }
         );
     }
