@@ -34,6 +34,9 @@ const SHELL_ACTIVE_SCREEN_ATTR: &str = "shell.active_screen";
 const SHELL_CONFIG_STATUS_ATTR: &str = "shell.config_status";
 const SHELL_AUTH_STATUS_ATTR: &str = "shell.auth_status";
 const SHELL_AUTH_URL_ATTR: &str = "shell.auth_url";
+const SHELL_FATAL_SOURCE_ATTR: &str = "shell.fatal_source";
+const SHELL_FATAL_MESSAGE_ATTR: &str = "shell.fatal_message";
+const SHELL_FATAL_DETAILS_ATTR: &str = "shell.fatal_details";
 
 fn main() {
     if let Err(err) = run() {
@@ -103,8 +106,36 @@ pub enum ScreenTransition {
     Back,
 }
 
+/// User-facing description of an unrecoverable error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FatalError {
+    /// Short subsystem label shown as the headline (e.g. "Spotify auth").
+    pub source: &'static str,
+    /// One-line summary of what failed.
+    pub message: String,
+    /// Optional next steps for the user.
+    pub details: Option<String>,
+}
+
+impl FatalError {
+    /// Creates a fatal error with a subsystem label and message.
+    pub fn new(source: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            source,
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    /// Adds optional next-step details to the fatal error.
+    pub fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
+    }
+}
+
 /// Messages emitted by components and converted into app-level actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
     /// Request application shutdown.
     Quit,
@@ -114,6 +145,8 @@ pub enum Msg {
     WindowResize { width: u16, height: u16 },
     /// Request a screen navigation transition.
     Navigate(ScreenTransition),
+    /// Surface an unrecoverable error and route to the fatal error screen.
+    Fatal(FatalError),
 }
 
 /// Actions handled by the central state dispatcher.
@@ -129,6 +162,8 @@ enum Action {
     Navigate(ScreenTransition),
     /// Apply a Spotify auth flow status update.
     AuthEvent(AuthEvent),
+    /// Surface an unrecoverable error and route to the fatal error screen.
+    Fatal(FatalError),
     /// Mark the UI as needing a redraw.
     RequestRedraw,
     /// Mark the current draw request as handled.
@@ -142,6 +177,7 @@ impl From<Msg> for Action {
             Msg::Tick => Self::Tick,
             Msg::WindowResize { width, height } => Self::Resize { width, height },
             Msg::Navigate(transition) => Self::Navigate(transition),
+            Msg::Fatal(error) => Self::Fatal(error),
         }
     }
 }
@@ -219,6 +255,8 @@ struct AppState {
     auth: AuthUiState,
     /// State rendered by the shell component.
     shell: ShellState,
+    /// Active fatal error, when the app has routed to the fatal screen.
+    fatal: Option<FatalError>,
 }
 
 impl AppState {
@@ -264,6 +302,12 @@ impl AppState {
                 self.auth.apply(event);
                 self.needs_redraw = true;
             }
+            Action::Fatal(error) => {
+                self.fatal = Some(error);
+                self.router
+                    .apply(ScreenTransition::Replace(Screen::FatalError));
+                self.needs_redraw = true;
+            }
             Action::RequestRedraw => {
                 self.needs_redraw = true;
             }
@@ -271,6 +315,18 @@ impl AppState {
                 self.needs_redraw = false;
             }
         }
+    }
+}
+
+/// Returns a fatal-error description for any auth event that ends the flow unrecoverably.
+fn fatal_from_auth_event(event: &AuthEvent) -> Option<FatalError> {
+    match event {
+        AuthEvent::Failed { message } => Some(
+            FatalError::new("Spotify auth", message.clone()).with_details(
+                "Verify your Spotify client ID and redirect URI in the app config, then restart spotuify.",
+            ),
+        ),
+        _ => None,
     }
 }
 
@@ -402,6 +458,12 @@ struct ShellState {
     auth_status: String,
     /// Authorization URL rendered when user action may be required.
     auth_url: Option<String>,
+    /// Fatal error subsystem rendered on the fatal error screen.
+    fatal_source: Option<String>,
+    /// Fatal error message rendered on the fatal error screen.
+    fatal_message: Option<String>,
+    /// Fatal error next-step details rendered on the fatal error screen.
+    fatal_details: Option<String>,
 }
 
 impl Default for ShellState {
@@ -413,6 +475,9 @@ impl Default for ShellState {
             config_status: "config not checked".to_owned(),
             auth_status: "Spotify auth not started".to_owned(),
             auth_url: None,
+            fatal_source: None,
+            fatal_message: None,
+            fatal_details: None,
         }
     }
 }
@@ -495,6 +560,9 @@ impl Model {
         }
 
         for event in events {
+            if let Some(fatal) = fatal_from_auth_event(&event) {
+                self.dispatch(Action::Fatal(fatal));
+            }
             self.dispatch(Action::AuthEvent(event));
         }
 
@@ -561,6 +629,39 @@ impl Model {
             Attribute::Custom(SHELL_AUTH_URL_ATTR),
             AttrValue::String(self.state.auth.authorize_url.clone().unwrap_or_default()),
         )?;
+        self.app.attr(
+            &Id::Shell,
+            Attribute::Custom(SHELL_FATAL_SOURCE_ATTR),
+            AttrValue::String(
+                self.state
+                    .fatal
+                    .as_ref()
+                    .map(|fatal| fatal.source.to_owned())
+                    .unwrap_or_default(),
+            ),
+        )?;
+        self.app.attr(
+            &Id::Shell,
+            Attribute::Custom(SHELL_FATAL_MESSAGE_ATTR),
+            AttrValue::String(
+                self.state
+                    .fatal
+                    .as_ref()
+                    .map(|fatal| fatal.message.clone())
+                    .unwrap_or_default(),
+            ),
+        )?;
+        self.app.attr(
+            &Id::Shell,
+            Attribute::Custom(SHELL_FATAL_DETAILS_ATTR),
+            AttrValue::String(
+                self.state
+                    .fatal
+                    .as_ref()
+                    .and_then(|fatal| fatal.details.clone())
+                    .unwrap_or_default(),
+            ),
+        )?;
 
         Ok(())
     }
@@ -572,8 +673,8 @@ struct Shell {
     render_state: ShellState,
 }
 
-impl Component for Shell {
-    fn view(&mut self, frame: &mut Frame, area: Rect) {
+impl Shell {
+    fn render_default_widget(&self, area: Rect) -> Paragraph<'_> {
         let size = self
             .render_state
             .terminal_size
@@ -594,16 +695,54 @@ impl Component for Shell {
         }
         text.push_str("\n\nPress q, Esc, or Ctrl-C to quit.");
 
-        let widget = Paragraph::new(text)
+        Paragraph::new(text)
             .block(
                 Block::default()
                     .title(" spotuify ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Green)),
             )
-            .wrap(Wrap { trim: true });
+            .wrap(Wrap { trim: true })
+    }
 
-        frame.render_widget(widget, area);
+    fn render_fatal_widget(&self) -> Paragraph<'_> {
+        let source = self
+            .render_state
+            .fatal_source
+            .as_deref()
+            .unwrap_or("Unknown subsystem");
+        let message = self
+            .render_state
+            .fatal_message
+            .as_deref()
+            .unwrap_or("Unrecoverable error.");
+        let mut text = format!("{source} encountered an unrecoverable error.\n\n{message}");
+        if let Some(details) = self.render_state.fatal_details.as_deref()
+            && !details.is_empty()
+        {
+            text.push_str("\n\nNext steps:\n");
+            text.push_str(details);
+        }
+        text.push_str("\n\nPress q, Esc, or Ctrl-C to quit.");
+
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .title(" spotuify — fatal error ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
+            )
+            .wrap(Wrap { trim: true })
+    }
+}
+
+impl Component for Shell {
+    fn view(&mut self, frame: &mut Frame, area: Rect) {
+        if self.render_state.active_screen == Screen::FatalError.label() {
+            frame.render_widget(self.render_fatal_widget(), area);
+        } else {
+            frame.render_widget(self.render_default_widget(area), area);
+        }
     }
 
     fn query<'a>(&'a self, _attr: Attribute) -> Option<QueryResult<'a>> {
@@ -637,6 +776,27 @@ impl Component for Shell {
                     None
                 } else {
                     Some(auth_url)
+                };
+            }
+            (Attribute::Custom(SHELL_FATAL_SOURCE_ATTR), AttrValue::String(source)) => {
+                self.render_state.fatal_source = if source.is_empty() {
+                    None
+                } else {
+                    Some(source)
+                };
+            }
+            (Attribute::Custom(SHELL_FATAL_MESSAGE_ATTR), AttrValue::String(message)) => {
+                self.render_state.fatal_message = if message.is_empty() {
+                    None
+                } else {
+                    Some(message)
+                };
+            }
+            (Attribute::Custom(SHELL_FATAL_DETAILS_ATTR), AttrValue::String(details)) => {
+                self.render_state.fatal_details = if details.is_empty() {
+                    None
+                } else {
+                    Some(details)
                 };
             }
             _ => {}
@@ -986,7 +1146,153 @@ mod tests {
                 config_status: "missing config file; setup required".to_owned(),
                 auth_status: "Spotify auth starting".to_owned(),
                 auth_url: Some("http://127.0.0.1:8888/authorize".to_owned()),
+                fatal_source: None,
+                fatal_message: None,
+                fatal_details: None,
             }
+        );
+    }
+
+    #[test]
+    fn dispatcher_routes_to_fatal_error_screen() {
+        let mut state = AppState::default();
+
+        state.apply(Action::Fatal(
+            FatalError::new("Spotify auth", "auth flow exploded").with_details("Check config."),
+        ));
+
+        assert_eq!(
+            state.fatal,
+            Some(
+                FatalError::new("Spotify auth", "auth flow exploded").with_details("Check config.")
+            )
+        );
+        assert_eq!(state.router.current(), Screen::FatalError);
+        assert_eq!(state.router.stack, vec![Screen::FatalError]);
+        assert!(state.needs_redraw);
+    }
+
+    #[test]
+    fn dispatcher_replaces_existing_screen_on_fatal() {
+        let mut state = AppState::default();
+        state.apply(Action::Navigate(ScreenTransition::Replace(Screen::Auth)));
+        state.apply(Action::Rendered);
+
+        state.apply(Action::Fatal(FatalError::new("Spotify auth", "boom")));
+
+        assert_eq!(state.router.current(), Screen::FatalError);
+        assert_eq!(state.router.stack, vec![Screen::FatalError]);
+        assert!(state.fatal.is_some());
+        assert!(state.needs_redraw);
+    }
+
+    #[test]
+    fn shell_renders_fatal_error_attrs() {
+        let mut shell = Shell::default();
+
+        shell.attr(
+            Attribute::Custom(SHELL_ACTIVE_SCREEN_ATTR),
+            AttrValue::String(Screen::FatalError.label().to_owned()),
+        );
+        shell.attr(
+            Attribute::Custom(SHELL_FATAL_SOURCE_ATTR),
+            AttrValue::String("Spotify auth".to_owned()),
+        );
+        shell.attr(
+            Attribute::Custom(SHELL_FATAL_MESSAGE_ATTR),
+            AttrValue::String("auth flow exploded".to_owned()),
+        );
+        shell.attr(
+            Attribute::Custom(SHELL_FATAL_DETAILS_ATTR),
+            AttrValue::String("Check config.".to_owned()),
+        );
+
+        assert_eq!(shell.render_state.active_screen, Screen::FatalError.label());
+        assert_eq!(
+            shell.render_state.fatal_source.as_deref(),
+            Some("Spotify auth")
+        );
+        assert_eq!(
+            shell.render_state.fatal_message.as_deref(),
+            Some("auth flow exploded")
+        );
+        assert_eq!(
+            shell.render_state.fatal_details.as_deref(),
+            Some("Check config.")
+        );
+    }
+
+    #[test]
+    fn shell_clears_fatal_attrs_when_pushed_empty() {
+        let mut shell = Shell::default();
+        shell.render_state.fatal_source = Some("Spotify auth".to_owned());
+        shell.render_state.fatal_message = Some("boom".to_owned());
+        shell.render_state.fatal_details = Some("Check config.".to_owned());
+
+        shell.attr(
+            Attribute::Custom(SHELL_FATAL_SOURCE_ATTR),
+            AttrValue::String(String::new()),
+        );
+        shell.attr(
+            Attribute::Custom(SHELL_FATAL_MESSAGE_ATTR),
+            AttrValue::String(String::new()),
+        );
+        shell.attr(
+            Attribute::Custom(SHELL_FATAL_DETAILS_ATTR),
+            AttrValue::String(String::new()),
+        );
+
+        assert_eq!(shell.render_state.fatal_source, None);
+        assert_eq!(shell.render_state.fatal_message, None);
+        assert_eq!(shell.render_state.fatal_details, None);
+    }
+
+    #[test]
+    fn auth_failed_event_produces_fatal_error() {
+        let event = AuthEvent::Failed {
+            message: "Spotify token endpoint returned HTTP 400: invalid_grant".to_owned(),
+        };
+
+        let fatal = fatal_from_auth_event(&event).expect("Failed event should produce fatal");
+
+        assert_eq!(fatal.source, "Spotify auth");
+        assert_eq!(
+            fatal.message,
+            "Spotify token endpoint returned HTTP 400: invalid_grant"
+        );
+        assert!(fatal.details.is_some());
+    }
+
+    #[test]
+    fn non_failed_auth_events_do_not_produce_fatal_error() {
+        assert!(fatal_from_auth_event(&AuthEvent::Starting).is_none());
+        assert!(
+            fatal_from_auth_event(&AuthEvent::Cached {
+                cache_path: PathBuf::from("/tmp/token.json"),
+            })
+            .is_none()
+        );
+        assert!(
+            fatal_from_auth_event(&AuthEvent::ReauthorizationRequired {
+                message: "reauth required".to_owned(),
+            })
+            .is_none()
+        );
+        assert!(
+            fatal_from_auth_event(&AuthEvent::Completed {
+                cache_path: PathBuf::from("/tmp/token.json"),
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn fatal_error_navigation_message_converts_to_action() {
+        let fatal = FatalError::new("Spotify auth", "boom");
+
+        assert_eq!(
+            Action::from(Msg::Fatal(fatal.clone())),
+            Action::Fatal(fatal)
         );
     }
 }
