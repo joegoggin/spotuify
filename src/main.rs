@@ -54,15 +54,41 @@ enum Id {
     Shell,
 }
 
+/// Logical screens that can be reached through app navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Screen {
+    /// Default app entry screen.
+    Home,
+    /// First-run setup and config validation screen.
+    Setup,
+    /// Spotify authentication screen.
+    Auth,
+    /// Fatal error recovery screen.
+    FatalError,
+}
+
+/// Navigation transitions supported by the app router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenTransition {
+    /// Add a screen to the top of the navigation stack.
+    Push(Screen),
+    /// Replace the current screen with another screen.
+    Replace(Screen),
+    /// Return to the previous screen when history exists.
+    Back,
+}
+
 /// Messages emitted by components and converted into app-level actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Msg {
+pub enum Msg {
     /// Request application shutdown.
     Quit,
     /// Record a UI tick.
     Tick,
     /// Record the latest terminal size.
     WindowResize { width: u16, height: u16 },
+    /// Request a screen navigation transition.
+    Navigate(ScreenTransition),
 }
 
 /// Actions handled by the central state dispatcher.
@@ -74,6 +100,8 @@ enum Action {
     Tick,
     /// Store the latest terminal size.
     Resize { width: u16, height: u16 },
+    /// Apply a screen navigation transition.
+    Navigate(ScreenTransition),
     /// Mark the UI as needing a redraw.
     RequestRedraw,
     /// Mark the current draw request as handled.
@@ -86,7 +114,61 @@ impl From<Msg> for Action {
             Msg::Quit => Self::Quit,
             Msg::Tick => Self::Tick,
             Msg::WindowResize { width, height } => Self::Resize { width, height },
+            Msg::Navigate(transition) => Self::Navigate(transition),
         }
+    }
+}
+
+/// Screen navigation state for the running application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Router {
+    /// Screen history stack, with the active screen at the end.
+    stack: Vec<Screen>,
+}
+
+impl Router {
+    /// Creates router state with the default entry screen.
+    fn new() -> Self {
+        Self {
+            stack: vec![Screen::Home],
+        }
+    }
+
+    /// Returns the active screen.
+    fn current(&self) -> Screen {
+        self.stack.last().copied().unwrap_or(Screen::Home)
+    }
+
+    /// Applies a transition and reports whether the stack changed.
+    fn apply(&mut self, transition: ScreenTransition) -> bool {
+        match transition {
+            ScreenTransition::Push(screen) if self.current() != screen => {
+                self.stack.push(screen);
+                true
+            }
+            ScreenTransition::Push(_) => false,
+            ScreenTransition::Replace(screen) if self.current() != screen => {
+                if let Some(current) = self.stack.last_mut() {
+                    *current = screen;
+                } else {
+                    self.stack.push(screen);
+                }
+
+                true
+            }
+            ScreenTransition::Replace(_) => false,
+            ScreenTransition::Back if self.stack.len() > 1 => {
+                self.stack.pop();
+                true
+            }
+            ScreenTransition::Back => false,
+        }
+    }
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -97,6 +179,8 @@ struct AppState {
     should_quit: bool,
     /// Whether the terminal should be redrawn.
     needs_redraw: bool,
+    /// Current screen route and navigation history.
+    router: Router,
     /// State rendered by the shell component.
     shell: ShellState,
 }
@@ -124,6 +208,11 @@ impl AppState {
                 self.shell.terminal_size = Some((width, height));
                 self.needs_redraw = true;
             }
+            Action::Navigate(transition) => {
+                if self.router.apply(transition) {
+                    self.needs_redraw = true;
+                }
+            }
             Action::RequestRedraw => {
                 self.needs_redraw = true;
             }
@@ -139,6 +228,7 @@ impl Default for AppState {
         Self {
             should_quit: false,
             needs_redraw: false,
+            router: Router::default(),
             shell: ShellState::default(),
         }
     }
@@ -337,7 +427,71 @@ mod tests {
 
         assert!(!state.should_quit);
         assert!(state.needs_redraw);
+        assert_eq!(state.router.current(), Screen::Home);
+        assert_eq!(state.router.stack, vec![Screen::Home]);
         assert_eq!(state.shell, ShellState::default());
+    }
+
+    #[test]
+    fn dispatcher_pushes_new_screen_and_requests_redraw() {
+        let mut state = AppState::default();
+
+        state.apply(Action::Navigate(ScreenTransition::Push(Screen::Setup)));
+
+        assert_eq!(state.router.stack, vec![Screen::Home, Screen::Setup]);
+        assert!(state.needs_redraw);
+    }
+
+    #[test]
+    fn dispatcher_ignores_push_of_current_screen() {
+        let mut state = AppState::default();
+
+        state.apply(Action::Navigate(ScreenTransition::Push(Screen::Home)));
+
+        assert_eq!(state.router.stack, vec![Screen::Home]);
+        assert!(!state.needs_redraw);
+    }
+
+    #[test]
+    fn dispatcher_replaces_current_screen_and_requests_redraw() {
+        let mut state = AppState::default();
+
+        state.apply(Action::Navigate(ScreenTransition::Replace(Screen::Auth)));
+
+        assert_eq!(state.router.stack, vec![Screen::Auth]);
+        assert!(state.needs_redraw);
+    }
+
+    #[test]
+    fn dispatcher_navigates_back_when_history_exists() {
+        let mut state = AppState::default();
+        state.apply(Action::Navigate(ScreenTransition::Push(Screen::Setup)));
+        state.apply(Action::Rendered);
+
+        state.apply(Action::Navigate(ScreenTransition::Back));
+
+        assert_eq!(state.router.stack, vec![Screen::Home]);
+        assert!(state.needs_redraw);
+    }
+
+    #[test]
+    fn dispatcher_ignores_back_at_root_screen() {
+        let mut state = AppState::default();
+
+        state.apply(Action::Navigate(ScreenTransition::Back));
+
+        assert_eq!(state.router.stack, vec![Screen::Home]);
+        assert!(!state.needs_redraw);
+    }
+
+    #[test]
+    fn navigation_messages_convert_to_actions() {
+        let transition = ScreenTransition::Replace(Screen::FatalError);
+
+        assert_eq!(
+            Action::from(Msg::Navigate(transition)),
+            Action::Navigate(transition)
+        );
     }
 
     #[test]
