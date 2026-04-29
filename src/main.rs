@@ -19,6 +19,8 @@ use tuirealm::terminal::{CrosstermTerminalAdapter, TerminalAdapter, TerminalResu
 
 mod auth;
 mod config;
+#[allow(dead_code)]
+mod spotify;
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
@@ -312,6 +314,27 @@ impl AuthUiState {
                     "Spotify session loaded from cached token at {}",
                     cache_path.display()
                 );
+                self.authorize_url = None;
+                self.browser_open_error = None;
+            }
+            AuthEvent::RefreshingCachedToken { cache_path } => {
+                self.status = format!(
+                    "Spotify cached token at {} expired; refreshing session",
+                    cache_path.display()
+                );
+                self.authorize_url = None;
+                self.browser_open_error = None;
+            }
+            AuthEvent::RefreshedCachedToken { cache_path } => {
+                self.status = format!(
+                    "Spotify session refreshed and saved at {}",
+                    cache_path.display()
+                );
+                self.authorize_url = None;
+                self.browser_open_error = None;
+            }
+            AuthEvent::ReauthorizationRequired { message } => {
+                self.status = message;
                 self.authorize_url = None;
                 self.browser_open_error = None;
             }
@@ -769,6 +792,50 @@ mod tests {
             Action::from(Msg::Navigate(transition)),
             Action::Navigate(transition)
         );
+    }
+
+    #[test]
+    fn auth_ui_state_renders_cached_token_refresh_events() {
+        let mut state = AuthUiState::default();
+
+        state.apply(AuthEvent::RefreshingCachedToken {
+            cache_path: PathBuf::from("/tmp/spotuify/token.json"),
+        });
+
+        assert_eq!(
+            state.status,
+            "Spotify cached token at /tmp/spotuify/token.json expired; refreshing session"
+        );
+        assert_eq!(state.authorize_url, None);
+        assert_eq!(state.browser_open_error, None);
+
+        state.apply(AuthEvent::RefreshedCachedToken {
+            cache_path: PathBuf::from("/tmp/spotuify/token.json"),
+        });
+
+        assert_eq!(
+            state.status,
+            "Spotify session refreshed and saved at /tmp/spotuify/token.json"
+        );
+        assert_eq!(state.authorize_url, None);
+        assert_eq!(state.browser_open_error, None);
+    }
+
+    #[test]
+    fn auth_ui_state_renders_reauthorization_required_message() {
+        let mut state = AuthUiState {
+            status: "old status".to_owned(),
+            authorize_url: Some("https://accounts.spotify.com/authorize".to_owned()),
+            browser_open_error: Some("browser error".to_owned()),
+        };
+
+        state.apply(AuthEvent::ReauthorizationRequired {
+            message: "Spotify reauthorization required".to_owned(),
+        });
+
+        assert_eq!(state.status, "Spotify reauthorization required");
+        assert_eq!(state.authorize_url, None);
+        assert_eq!(state.browser_open_error, None);
     }
 
     #[test]

@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use rspotify::prelude::OAuthClient;
+use rspotify::prelude::{BaseClient, OAuthClient};
 use rspotify::{
-    AuthCodePkceSpotify, ClientError, Config as SpotifyClientConfig, Credentials, OAuth, scopes,
+    AuthCodePkceSpotify, ClientError, Config as SpotifyClientConfig, Credentials, OAuth, Token,
+    scopes,
 };
 use url::Url;
 
@@ -29,6 +30,12 @@ pub(crate) enum AuthEvent {
     Starting,
     /// A valid cached token was found and can be reused.
     Cached { cache_path: PathBuf },
+    /// An expired cached token is being refreshed.
+    RefreshingCachedToken { cache_path: PathBuf },
+    /// An expired cached token was refreshed and can be reused.
+    RefreshedCachedToken { cache_path: PathBuf },
+    /// Cached credentials cannot be reused and browser reauthorization is required.
+    ReauthorizationRequired { message: String },
     /// A browser authorization URL was generated.
     AuthorizationUrl {
         /// URL the user must visit to authorize the app.
@@ -53,7 +60,10 @@ impl AuthEvent {
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Cached { .. } | Self::Completed { .. } | Self::Failed { .. }
+            Self::Cached { .. }
+                | Self::RefreshedCachedToken { .. }
+                | Self::Completed { .. }
+                | Self::Failed { .. }
         )
     }
 }
@@ -220,10 +230,7 @@ impl AuthSession {
         &mut self,
         mut on_event: impl FnMut(AuthEvent),
     ) -> Result<(), AuthError> {
-        if self.load_cached_token()? {
-            on_event(AuthEvent::Cached {
-                cache_path: self.cache_path.clone(),
-            });
+        if self.try_cached_token(&mut on_event)? {
             return Ok(());
         }
 
@@ -264,18 +271,96 @@ impl AuthSession {
         }
     }
 
-    fn load_cached_token(&self) -> Result<bool, AuthError> {
+    fn try_cached_token(&self, on_event: &mut impl FnMut(AuthEvent)) -> Result<bool, AuthError> {
         if !self.cache_path.exists() {
             return Ok(false);
         }
 
-        match self.client.read_token_cache(false) {
-            Ok(Some(_)) => Ok(true),
-            Ok(None) => Ok(false),
-            Err(err) => Err(AuthError::Spotify(format!(
-                "could not read token cache: {err}"
-            ))),
+        match self.client.read_token_cache(true) {
+            Ok(Some(token)) if token.is_expired() => self.refresh_cached_token(token, on_event),
+            Ok(Some(token)) => {
+                self.replace_client_token(Some(token))?;
+                on_event(AuthEvent::Cached {
+                    cache_path: self.cache_path.clone(),
+                });
+                Ok(true)
+            }
+            Ok(None) => {
+                on_event(AuthEvent::ReauthorizationRequired {
+                    message:
+                        "Cached Spotify token is missing required scopes; reauthorization required"
+                            .to_owned(),
+                });
+                Ok(false)
+            }
+            Err(err) => {
+                on_event(AuthEvent::ReauthorizationRequired {
+                    message: format!(
+                        "Cached Spotify token could not be read ({err}); reauthorization required"
+                    ),
+                });
+                Ok(false)
+            }
         }
+    }
+
+    fn refresh_cached_token(
+        &self,
+        token: Token,
+        on_event: &mut impl FnMut(AuthEvent),
+    ) -> Result<bool, AuthError> {
+        on_event(AuthEvent::RefreshingCachedToken {
+            cache_path: self.cache_path.clone(),
+        });
+        self.replace_client_token(Some(token))?;
+
+        match self.client.refresh_token() {
+            Ok(()) if self.has_usable_client_token()? => {
+                on_event(AuthEvent::RefreshedCachedToken {
+                    cache_path: self.cache_path.clone(),
+                });
+                Ok(true)
+            }
+            Ok(()) => {
+                self.replace_client_token(None)?;
+                on_event(AuthEvent::ReauthorizationRequired {
+                    message: "Cached Spotify token did not include a refresh token; reauthorization required"
+                        .to_owned(),
+                });
+                Ok(false)
+            }
+            Err(err) => {
+                self.replace_client_token(None)?;
+                on_event(AuthEvent::ReauthorizationRequired {
+                    message: format!(
+                        "Cached Spotify token refresh failed ({}); reauthorization required",
+                        spotify_client_error_message(err)
+                    ),
+                });
+                Ok(false)
+            }
+        }
+    }
+
+    fn replace_client_token(&self, token: Option<Token>) -> Result<(), AuthError> {
+        let token_store = self.client.get_token();
+        let mut token_store = token_store
+            .lock()
+            .map_err(|_| AuthError::Spotify("Spotify token lock was poisoned".to_owned()))?;
+        *token_store = token;
+
+        Ok(())
+    }
+
+    fn has_usable_client_token(&self) -> Result<bool, AuthError> {
+        let token_store = self.client.get_token();
+        let token_store = token_store
+            .lock()
+            .map_err(|_| AuthError::Spotify("Spotify token lock was poisoned".to_owned()))?;
+
+        Ok(token_store
+            .as_ref()
+            .is_some_and(|token| !token.is_expired()))
     }
 
     fn bind_local_callback(&self) -> Result<CallbackListener, AuthError> {
@@ -570,12 +655,66 @@ mod tests {
     use super::*;
     use crate::config::SpotifyConfig;
 
+    fn required_test_scopes() -> std::collections::HashSet<String> {
+        scopes!(
+            "user-read-private",
+            "user-read-playback-state",
+            "user-read-currently-playing",
+            "user-modify-playback-state",
+            "user-library-read",
+            "playlist-read-private",
+            "playlist-read-collaborative"
+        )
+    }
+
     fn valid_config() -> AppConfig {
         AppConfig {
             spotify: SpotifyConfig {
                 client_id: Some("client-id".to_owned()),
                 redirect_uri: Some("http://127.0.0.1:8888/callback".to_owned()),
             },
+        }
+    }
+
+    fn temp_token_path(test_name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "spotuify-{test_name}-{}-token.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    fn test_auth_session(test_name: &str) -> AuthSession {
+        let cache_path = temp_token_path(test_name);
+        let redirect_uri = "http://127.0.0.1:8888/callback";
+        let credentials = Credentials::new_pkce("client-id");
+        let oauth = OAuth {
+            redirect_uri: redirect_uri.to_owned(),
+            scopes: required_test_scopes(),
+            ..OAuth::default()
+        };
+        let client_config = SpotifyClientConfig {
+            cache_path: cache_path.clone(),
+            token_cached: true,
+            token_refreshing: true,
+            ..SpotifyClientConfig::default()
+        };
+        let client = AuthCodePkceSpotify::with_config(credentials, oauth, client_config);
+
+        AuthSession {
+            client,
+            redirect: LocalRedirect::from_uri(redirect_uri).expect("redirect should parse"),
+            cache_path,
+        }
+    }
+
+    fn expired_token(refresh_token: Option<&str>) -> Token {
+        Token {
+            access_token: "expired-access-token".to_owned(),
+            refresh_token: refresh_token.map(str::to_owned),
+            scopes: required_test_scopes(),
+            ..Token::default()
         }
     }
 
@@ -615,6 +754,53 @@ mod tests {
             .expect_err("localhost redirect should fail");
 
         assert!(matches!(err, AuthError::InvalidRedirectUri(_)));
+    }
+
+    #[test]
+    fn cached_expired_token_without_refresh_token_falls_back_to_reauthorization() {
+        let session = test_auth_session("expired-without-refresh");
+        expired_token(None)
+            .write_cache(&session.cache_path)
+            .expect("token cache should be writable");
+        let mut events = Vec::new();
+
+        let reused_cache = session
+            .try_cached_token(&mut |event| events.push(event))
+            .expect("cache fallback should not fail auth flow");
+
+        let _ = fs::remove_file(&session.cache_path);
+        assert!(!reused_cache);
+        assert_eq!(
+            events.first(),
+            Some(&AuthEvent::RefreshingCachedToken {
+                cache_path: session.cache_path.clone(),
+            })
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AuthEvent::ReauthorizationRequired { message })
+                if message.contains("reauthorization required")
+        ));
+    }
+
+    #[test]
+    fn malformed_cached_token_falls_back_to_reauthorization() {
+        let session = test_auth_session("malformed-cache");
+        fs::write(&session.cache_path, "not valid token json")
+            .expect("token cache should be writable");
+        let mut events = Vec::new();
+
+        let reused_cache = session
+            .try_cached_token(&mut |event| events.push(event))
+            .expect("malformed cache should not fail auth flow");
+
+        let _ = fs::remove_file(&session.cache_path);
+        assert!(!reused_cache);
+        assert!(matches!(
+            events.as_slice(),
+            [AuthEvent::ReauthorizationRequired { message }]
+                if message.contains("could not be read")
+        ));
     }
 
     #[test]
@@ -697,11 +883,29 @@ mod tests {
             .is_terminal()
         );
         assert!(
+            AuthEvent::RefreshedCachedToken {
+                cache_path: PathBuf::from("/tmp/token.json"),
+            }
+            .is_terminal()
+        );
+        assert!(
             AuthEvent::Failed {
                 message: "failed".to_owned(),
             }
             .is_terminal()
         );
         assert!(!AuthEvent::Starting.is_terminal());
+        assert!(
+            !AuthEvent::RefreshingCachedToken {
+                cache_path: PathBuf::from("/tmp/token.json"),
+            }
+            .is_terminal()
+        );
+        assert!(
+            !AuthEvent::ReauthorizationRequired {
+                message: "reauth required".to_owned(),
+            }
+            .is_terminal()
+        );
     }
 }
