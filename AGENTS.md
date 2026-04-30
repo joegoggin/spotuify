@@ -75,6 +75,7 @@ following:
 - Include detailed code examples for each step
 - Include steps for manually testing the changes
 - DO NOT implement the plan 
+- DO NOT create instructions unless specifically asked
 
 #### Updating Issues
 

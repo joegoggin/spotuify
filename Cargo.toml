@@ -3,4 +3,16 @@ name = "spotuify"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "spotuify"
+path = "src/lib.rs"
+
 [dependencies]
+open = "5.3.4"
+rspotify = { version = "0.16.1", default-features = false, features = ["client-ureq", "ureq-rustls-tls-native-certs"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "1.1.2"
+tuirealm = "4.0.0"
+url = "2.5.7"
+xdg = "3.0.0"
