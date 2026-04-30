@@ -18,6 +18,7 @@ use crate::ui::screens::{AuthScreen, FatalScreen, HomeScreen, SetupScreen};
 use super::action::Action;
 use super::fatal::fatal_from_auth_event;
 use super::msg::Msg;
+use super::router::{Screen, ScreenTransition};
 use super::state::AppState;
 
 /// Poll interval used for keyboard input listener events.
@@ -43,16 +44,18 @@ impl Model {
     /// Creates a runtime model and initializes the terminal.
     pub fn new() -> AppResult<Self> {
         let config = ConfigBootstrap::load();
-        let auth_rx = match &config {
+        let state = AppState::new(config);
+        let app = Self::init_app(&state)?;
+        let terminal = Self::init_terminal()?;
+        let auth_rx = match &state.config {
             ConfigBootstrap::Ready { config, .. } => Some(auth::spawn_auth_flow(config.clone())),
             ConfigBootstrap::NeedsSetup { .. } => None,
         };
-        let state = AppState::new(config);
 
         Ok(Self {
-            app: Self::init_app(&state)?,
+            app,
             state,
-            terminal: Self::init_terminal()?,
+            terminal,
             auth_rx,
         })
     }
@@ -139,11 +142,7 @@ impl Model {
 
         for event in events {
             self.sync_auth_event(event.clone())?;
-            if let Some(fatal) = fatal_from_auth_event(&event) {
-                self.dispatch(Action::Fatal(fatal))?;
-            } else {
-                self.dispatch(Action::RequestRedraw)?;
-            }
+            self.dispatch(action_for_auth_event(&event))?;
         }
 
         if clear_receiver {
@@ -203,5 +202,21 @@ impl Model {
         )?;
 
         Ok(())
+    }
+}
+
+/// Maps auth worker events into app-level state transitions.
+fn action_for_auth_event(event: &AuthEvent) -> Action {
+    if let Some(fatal) = fatal_from_auth_event(event) {
+        Action::Fatal(fatal)
+    } else if matches!(
+        event,
+        AuthEvent::Cached { .. }
+            | AuthEvent::RefreshedCachedToken { .. }
+            | AuthEvent::Completed { .. }
+    ) {
+        Action::Navigate(ScreenTransition::Replace(Screen::Home))
+    } else {
+        Action::RequestRedraw
     }
 }

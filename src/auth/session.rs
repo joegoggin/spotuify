@@ -112,10 +112,11 @@ impl AuthSession {
 
         let callback = listener.receive_authorization_code(&self.client)?;
         on_event(AuthEvent::ExchangingCode);
-        self.ensure_cache_parent_dir()?;
+        self.ensure_cache_file_permissions()?;
 
         match self.client.request_token(&callback.code) {
             Ok(()) => {
+                self.harden_cache_file_permissions()?;
                 callback.respond(HTTP_RESPONSE_OK, CALLBACK_RESPONSE_SUCCESS);
                 on_event(AuthEvent::Completed {
                     cache_path: self.cache_path.clone(),
@@ -135,6 +136,7 @@ impl AuthSession {
         if !self.cache_path.exists() {
             return Ok(false);
         }
+        self.harden_cache_file_permissions()?;
 
         match self.client.read_token_cache(true) {
             Ok(Some(token)) if token.is_expired() => self.refresh_cached_token(token, on_event),
@@ -173,22 +175,26 @@ impl AuthSession {
         on_event(AuthEvent::RefreshingCachedToken {
             cache_path: self.cache_path.clone(),
         });
+        let refresh_token = token.refresh_token.clone();
         self.replace_client_token(Some(token))?;
+        self.ensure_cache_file_permissions()?;
 
         match self.client.refresh_token() {
-            Ok(()) if self.has_usable_client_token()? => {
-                on_event(AuthEvent::RefreshedCachedToken {
-                    cache_path: self.cache_path.clone(),
-                });
-                Ok(true)
-            }
             Ok(()) => {
-                self.replace_client_token(None)?;
-                on_event(AuthEvent::ReauthorizationRequired {
-                    message: "Cached Spotify token did not include a refresh token; reauthorization required"
-                        .to_owned(),
-                });
-                Ok(false)
+                self.preserve_refresh_token_if_missing(refresh_token)?;
+                if self.has_usable_client_token()? {
+                    on_event(AuthEvent::RefreshedCachedToken {
+                        cache_path: self.cache_path.clone(),
+                    });
+                    Ok(true)
+                } else {
+                    self.replace_client_token(None)?;
+                    on_event(AuthEvent::ReauthorizationRequired {
+                        message: "Cached Spotify token did not include a refresh token; reauthorization required"
+                            .to_owned(),
+                    });
+                    Ok(false)
+                }
             }
             Err(err) => {
                 self.replace_client_token(None)?;
@@ -238,6 +244,54 @@ impl AuthSession {
         }
 
         Ok(())
+    }
+
+    /// Ensures the token cache exists with user-only permissions before token writes.
+    fn ensure_cache_file_permissions(&self) -> Result<(), AuthError> {
+        self.ensure_cache_parent_dir()?;
+        let _file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.cache_path)?;
+        self.harden_cache_file_permissions()
+    }
+
+    /// Restricts token cache access to the current user on Unix platforms.
+    fn harden_cache_file_permissions(&self) -> Result<(), AuthError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&self.cache_path, fs::Permissions::from_mode(0o600))?;
+        }
+
+        Ok(())
+    }
+
+    /// Restores the existing refresh token when Spotify omits one in a refresh response.
+    fn preserve_refresh_token_if_missing(
+        &self,
+        refresh_token: Option<String>,
+    ) -> Result<(), AuthError> {
+        let Some(refresh_token) = refresh_token else {
+            return Ok(());
+        };
+        let token_store = self.client.get_token();
+        let mut token_store = token_store
+            .lock()
+            .map_err(|_| AuthError::Spotify("Spotify token lock was poisoned".to_owned()))?;
+
+        if let Some(token) = token_store.as_mut()
+            && token.refresh_token.is_none()
+        {
+            token.refresh_token = Some(refresh_token);
+            token.write_cache(&self.cache_path).map_err(|err| {
+                AuthError::Spotify(format!("could not write Spotify token cache: {err}"))
+            })?;
+        }
+
+        drop(token_store);
+        self.harden_cache_file_permissions()
     }
 }
 
@@ -365,5 +419,78 @@ mod tests {
             [AuthEvent::ReauthorizationRequired { message }]
                 if message.contains("could not be read")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_cached_token_permissions_are_hardened_when_reused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let session = test_auth_session("valid-cache-permissions");
+        fs::write(
+            &session.cache_path,
+            r#"{
+                "access_token": "cached-access-token",
+                "expires_in": 3600,
+                "expires_at": "2999-01-01T00:00:00Z",
+                "refresh_token": "cached-refresh-token",
+                "scope": "user-read-private user-read-playback-state user-read-currently-playing user-modify-playback-state user-library-read playlist-read-private playlist-read-collaborative"
+            }"#,
+        )
+        .expect("token cache should be writable");
+        fs::set_permissions(&session.cache_path, fs::Permissions::from_mode(0o644))
+            .expect("test should loosen cache permissions");
+        let mut events = Vec::new();
+
+        let reused_cache = session
+            .try_cached_token(&mut |event| events.push(event))
+            .expect("valid cache should be reusable");
+
+        let mode = fs::metadata(&session.cache_path)
+            .expect("token cache metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        let _ = fs::remove_file(&session.cache_path);
+        assert!(reused_cache);
+        assert_eq!(mode, 0o600);
+        assert!(matches!(events.as_slice(), [AuthEvent::Cached { .. }]));
+    }
+
+    #[test]
+    fn missing_refresh_token_is_preserved_after_refresh_response() {
+        let session = test_auth_session("preserve-refresh-token");
+        session
+            .replace_client_token(Some(Token {
+                access_token: "refreshed-access-token".to_owned(),
+                refresh_token: None,
+                scopes: required_test_scopes(),
+                ..Token::default()
+            }))
+            .expect("test token should be loaded");
+
+        session
+            .preserve_refresh_token_if_missing(Some("cached-refresh-token".to_owned()))
+            .expect("refresh token should be restored");
+
+        let token_store = session.client.get_token();
+        let token_store = token_store
+            .lock()
+            .expect("test token lock should not poison");
+        assert_eq!(
+            token_store
+                .as_ref()
+                .and_then(|token| token.refresh_token.as_deref()),
+            Some("cached-refresh-token")
+        );
+        drop(token_store);
+
+        let cached_token =
+            Token::from_cache(&session.cache_path).expect("token cache should be readable");
+        let _ = fs::remove_file(&session.cache_path);
+        assert_eq!(
+            cached_token.refresh_token.as_deref(),
+            Some("cached-refresh-token")
+        );
     }
 }

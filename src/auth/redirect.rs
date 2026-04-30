@@ -42,7 +42,7 @@ impl LocalRedirect {
             )));
         }
 
-        let port = parsed.port_or_known_default().ok_or_else(|| {
+        let port = parsed.port().ok_or_else(|| {
             AuthError::InvalidRedirectUri("redirect URI is missing a port".to_owned())
         })?;
         let path = parsed.path().to_owned();
@@ -148,6 +148,14 @@ mod tests {
     fn local_redirect_rejects_https_scheme() {
         let err = LocalRedirect::from_uri("https://127.0.0.1:8888/callback")
             .expect_err("https redirect should fail");
+
+        assert!(matches!(err, AuthError::InvalidRedirectUri(_)));
+    }
+
+    #[test]
+    fn local_redirect_rejects_missing_explicit_port() {
+        let err = LocalRedirect::from_uri("http://127.0.0.1/callback")
+            .expect_err("redirect without explicit port should fail");
 
         assert!(matches!(err, AuthError::InvalidRedirectUri(_)));
     }
